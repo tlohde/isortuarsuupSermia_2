@@ -1,4 +1,4 @@
 src/*.ipynb
 data/*
 .ipynb_checkpoints
-src/__pycahce__
+src/__pycache__
