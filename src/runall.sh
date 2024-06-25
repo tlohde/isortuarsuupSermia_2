@@ -2,4 +2,4 @@
 
 micromamba activate paper2
 
-python --file ../is_aoi.geojson
+python run.py --file ../is_aoi.geojson
