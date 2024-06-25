@@ -4,7 +4,6 @@ from itslive cubes
 '''
 import itslive
 import numpy as np
-import os
 import pandas as pd
 import shapely
 from shapely import wkt
@@ -144,4 +143,3 @@ class Velocity():
         self.output.to_zarr(f'{path}.zarr')
         with xr.open_dataset(f'{path}.zarr') as _ds:
             _ds.to_netcdf(f'{path}.nc')
-            os.remove(f'{path}.zarr')
