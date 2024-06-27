@@ -5,4 +5,5 @@ data/*
 /src/__pycache_
 __pycache__/
 __pycache__
-_
+data/
+src/wip.ipynb
