@@ -153,7 +153,7 @@ class Elevation():
             return _fname.split('padded_')[-1].split('.tiff')[0]
         
         _dem_ids = [id_from_path(p) for p in self.downloaded_rasters]
-        _downloaded = [dem in self.catalog.dem_id.tolist() for dem in _dem_ids]
+        _downloaded = [dem in _dem_ids for dem in self.catalog.dem_id.tolist()]
         if all(_downloaded):
             self.missing_dems = False
         else:
