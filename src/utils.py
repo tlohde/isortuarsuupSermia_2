@@ -280,7 +280,7 @@ class Elevation():
         _search_period = f'{d1}/{d2}'
         _search = _catalog.search(collections=['sentinel-2-l2a',
                                                'landsat-c2-l2'],
-                                  bbox=self.geo,
+                                  intersects=self.geo,
                                   datetime=_search_period)
         _items = _search.item_collection()
         assert len(_items) > 0, 'did not find any images'
