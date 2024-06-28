@@ -314,10 +314,10 @@ class Elevation():
         and & it with stable terrain for every other dem
         to make list combined masks.
         '''
-        self.ref_mask = Elevation.make_mask(self.ref)
+        self.ref_mask = self.make_mask(self.ref)
         self.combined_to_reg_masks = []
         for f in self.to_reg:
-            _mask = Elevation.make_mask(f)
+            _mask = self.make_mask(f)
             _combined_mask = ((self.ref_mask & _mask) == 1).data
             self.combined_to_reg_masks.append(_combined_mask)
         self.pairs_and_mask = list(zip(self.pairs, self.combined_to_reg_masks))
