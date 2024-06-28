@@ -5,11 +5,14 @@ from itslive cubes
 import dask.delayed
 import dask.delayed
 import dask.delayed
+import dask.delayed
+import dask.delayed
 from dask.distributed import Lock
 import dask
 import geopandas as gpd
 from glob import glob
 import itslive
+from itertools import product
 import numpy as np
 import os
 import pandas as pd
@@ -25,6 +28,7 @@ import stackstac
 import subprocess
 from tqdm import tqdm
 import xarray as xr
+import xdem
 
 
 def geo_reproject(geo,
@@ -234,6 +238,7 @@ class Elevation():
         '''
         compute count of valid pixels
         dem with greatest number --> reference DEM
+        get list of dems to register (self.to_reg)
         '''
         _lazy_counts = []
         for f in self.downloaded_rasters:
@@ -246,7 +251,10 @@ class Elevation():
         _max = max(_result)
         for k, v in self.count_result.items():
             if v == _max:
-                self.ref_f = k
+                self.ref = k
+        
+        self.to_reg = [x for x in self.downloaded_rasters if x != self.ref]
+        self.pairs = list(product([self.ref], self.to_reg))
 
     def date_from_path(self, path):
         '''
@@ -266,7 +274,7 @@ class Elevation():
             modifier=pc.sign_inplace
             )
         
-        _date = Elevation.date_from_path(path)
+        _date = self.date_from_path(path)
         d1 = (_date - pd.Timedelta('14d')).strftime('%Y-%m-%d')
         d2 = (_date + pd.Timedelta('14d')).strftime('%Y-%m-%d')
         _search_period = f'{d1}/{d2}'
@@ -295,16 +303,74 @@ class Elevation():
         ndwi = ((img[0,:,:] - img[1,:,:]) /
                 (img[0,:,:] + img[1,:,:]))
         
-        return xr.where(ndwi < 0, 1, 0)
+        
+        with rio.open_rasterio(path, chunks='auto') as _ds:
+            return xr.where(ndwi < 0, 1, 0).rio.reproject_match(_ds)
     
-      
 
     def get_masks(self):
-        self.masks = []
-        for f in self.downloaded_rasters:
-            mask = Elevation.make_mask(f)
-            self.masks.append(mask)
-    
+        '''
+        make stable terrain mask from reference dem
+        and & it with stable terrain for every other dem
+        to make list combined masks.
+        '''
+        self.ref_mask = Elevation.make_mask(self.ref)
+        self.combined_to_reg_masks = []
+        for f in self.to_reg:
+            _mask = Elevation.make_mask(f)
+            _combined_mask = ((self.ref_mask & _mask) == 1).data
+            self.combined_to_reg_masks.append(_combined_mask)
+        self.pairs_and_mask = list(zip(self.pairs, self.combined_to_reg_masks))
+        
+    @dask.delayed
+    def lazy_register(pair_and_mask):
+        _pair, _mask = pair_and_mask
+        _ref_path, _to_reg_path = _pair
+        _ref = xdem.DEM(_ref_path)
+        _to_reg = xdem.DEM(_to_reg_path)
+        
+        _pipeline = xdem.coreg.NuthKaab() + xdem.coreg.Tilt()
+        _pipeline.fit(
+            reference_dem=_ref,
+            dem_to_be_aligned=_to_reg,
+            inlier_mask=_mask
+        )
+        
+        _regd = _pipeline.apply(_to_reg)
+        
+        stable_diff_before = (_ref - _to_reg)[_mask]
+        stable_diff_after = (_ref - _regd)[_mask]
+        
+        before_median = np.ma.median(stable_diff_before)
+        after_median = np.ma.median(stable_diff_after)
+        
+        before_nmad = xdem.spatialstats.nmad(stable_diff_before)
+        after_nmad = xdem.spatialstats.nmad(stable_diff_after)
+
+        output = _regd.to_xarray()
+        
+        output.attrs['to_register'] = _to_reg_path
+        # output.attrs['to_register_date'] = get_date(dem_to_reg).strftime('%Y-%m-%d')
+        # output.attrs['to_reg_mask'] = to_reg_mask['id'].values.item()
+        
+        output.attrs['reference'] = _ref_path
+        # output.attrs['reference_date'] = get_date(reference).strftime('%Y-%m-%d')
+        # output.attrs['ref_mask'] = ref_mask['id'].values.item()
+        
+        output.attrs['before_nmad'] = before_nmad
+        output.attrs['after_nmad'] = after_nmad
+        output.attrs['before_median'] = before_median
+        output.attrs['after_median'] = after_median
+        
+        return output
+        
+    def register(self):
+        self.registered_dems = []
+        for p_and_m in self.pairs_and_mask[0:2]:
+            _registered = Elevation.lazy_register(p_and_m)
+            self.registered_dems.append(_registered)
+            
+
         
         
 class Velocity():
