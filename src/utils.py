@@ -4,6 +4,7 @@ from itslive cubes
 '''
 import dask.delayed
 import dask.delayed
+import dask.delayed
 from dask.distributed import Lock
 import dask
 import geopandas as gpd
@@ -12,11 +13,15 @@ import itslive
 import numpy as np
 import os
 import pandas as pd
+import planetary_computer as pc
 import pyproj
+import pystac_client
+from pystac.extensions.eo import EOExtension as eo
 import shapely
 from shapely import wkt
 import rioxarray as rio
 from scipy.stats import median_abs_deviation
+import stackstac
 import subprocess
 from tqdm import tqdm
 import xarray as xr
@@ -214,23 +219,27 @@ class Elevation():
         '''
         dask.compute(*self.rasters)
         
-    ### coregistration routines ###
+    ############# coregistration routines #############
     
     @dask.delayed
     def get_lazy_count(filepath):
+        '''
+        lazily count valid pixels in downloaded dem
+        '''
         with rio.open_rasterio(filepath, chunks='auto') as dem:
             _total = (~dem.isnull()).sum().compute()
             return _total.data.item()
-    
-    def delayed_counts(self):
-        counts = []
+
+    def get_counts_and_reference(self):
+        '''
+        compute count of valid pixels
+        dem with greatest number --> reference DEM
+        '''
+        _lazy_counts = []
         for f in self.downloaded_rasters:
             count = Elevation.get_lazy_count(f)
-            counts.append(count)
-        return counts
-    
-    def get_counts_and_reference(self):
-        _lazy_counts = self.delayed_counts()
+            _lazy_counts.append(count)
+        
         _result = dask.compute(*_lazy_counts)
         self.count_result = dict(zip(self.downloaded_rasters, _result))
         
@@ -239,16 +248,62 @@ class Elevation():
             if v == _max:
                 self.ref_f = k
 
+    def date_from_path(self, path):
+        '''
+        get date from padded dem file path
+        '''
+        _fname = os.path.basename(path)
+        _id = _fname.split('padded_')[-1].split('.tiff')[0]
+        return self.catalog.loc[self.catalog.dem_id == _id, 'acqdate1']
     
-    def get_date(self, filename):
+    @dask.delayed
+    def make_mask(self, path):
         '''
-        matching `padded_*.tiff` file with row in `self.catalog`
-        for getting acqdate1
+        make stable terrain mask for given saved/padded dem
         '''
-        _stripped = filename.split('padded_')[-1]
-        _row = self.catalog.loc[self.catalog.dem_id == _stripped]
+        _catalog = pystac_client.Client.open(
+            "https://planetarycomputer.microsoft.com/api/stac/v1",
+            modifier=pc.sign_inplace
+            )
         
+        _date = Elevation.date_from_path(path)
+        d1 = (_date - pd.Timedelta('14d')).strftime('%Y-%m-%d')
+        d2 = (_date + pd.Timedelta('14d')).strftime('%Y-%m-%d')
+        _search_period = f'{d1}/{d2}'
+        _search = _catalog.search(collections=['sentinel-2-l2a',
+                                               'landsat-c2-l2'],
+                                  bbox=self.geo,
+                                  datetime=_search_period)
+        _items = _search.item_collection()
+        assert len(_items) > 0, 'did not find any images'
         
+        least_cloudy_item = min(_items, key=lambda item: eo.ext(item).cloud_cover)
+
+        _asset_dict = {'l':['green','nir08'],
+                       'S':['B03', 'B08']}
+
+        _assets = _asset_dict[least_cloudy_item.properties['platform'][0]]
+        
+        img = (stackstac.stack(
+            least_cloudy_item, epsg=3413,assets=_assets
+            ).squeeze()
+            .rio.clip_box(*self.geo.bounds, crs=4326)
+            )
+        
+        # can use [] indexing here because the order
+        # of assets in _asset dict is consistent 
+        ndwi = ((img[0,:,:] - img[1,:,:]) /
+                (img[0,:,:] + img[1,:,:]))
+        
+        return xr.where(ndwi < 0, 1, 0)
+    
+      
+
+    def get_masks(self):
+        self.masks = []
+        for f in self.downloaded_rasters:
+            mask = Elevation.make_mask(f)
+            self.masks.append(mask)
     
         
         
