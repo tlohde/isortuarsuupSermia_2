@@ -262,7 +262,7 @@ class Elevation():
         '''
         _fname = os.path.basename(path)
         _id = _fname.split('padded_')[-1].split('.tiff')[0]
-        return self.catalog.loc[self.catalog.dem_id == _id, 'acqdate1']
+        return self.catalog.loc[self.catalog.dem_id == _id, 'acqdate1'].item()
     
     @dask.delayed
     def make_mask(self, path):
