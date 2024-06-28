@@ -86,7 +86,7 @@ class Elevation():
         else:
             print(f'need download {len(self.missing_dems)} DEMs')
             self.get_dems()
-            # self.export_dems()
+            self.export_dems()
 
         print('all done')
         
