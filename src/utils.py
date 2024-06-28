@@ -64,9 +64,14 @@ class Elevation():
         self.geo = geo
         self.geo_projected = geo_reproject(geo, 4326, 3413)
         self.months = months
+        self.padded_rasters = glob('../data/arcticDEM/padded*.tiff')
         self.get_catalog()
-        self.get_dems()        
-        self.export_dems()
+        
+        if len(self.padded_rasters) == len(self.catalog):
+            print('already got all the DEMs')
+        else:
+            self.get_dems()
+            self.export_dems()
     
     def get_catalog(self):
         '''
@@ -177,6 +182,18 @@ class Elevation():
         compute / export all the dems
         '''
         dask.compute(*self.rasters)
+        
+    ### coregistration routines ###
+    def get_date(self, filename):
+        '''
+        matching `padded_*.tiff` file with row in `self.catalog`
+        for getting acqdate1
+        '''
+        _stripped = filename.split('padded_')[-1]
+        _row = self.catalog.loc[self.catalog.dem_id == _stripped]
+        
+        
+    
         
         
 class Velocity():
