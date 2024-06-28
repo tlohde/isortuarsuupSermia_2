@@ -3,6 +3,7 @@ class for generating median velocity composite stacks
 from itslive cubes
 '''
 import dask.delayed
+import dask.delayed
 from dask.distributed import Lock
 import dask
 import geopandas as gpd
@@ -63,16 +64,23 @@ class Elevation():
         
         self.geo = geo
         self.geo_projected = geo_reproject(geo, 4326, 3413)
-        self.months = months
-        self.padded_rasters = glob('../data/arcticDEM/padded*.tiff')
+        self.months = months     
         self.get_catalog()
         
-        if len(self.padded_rasters) == len(self.catalog):
-            print('already got all the DEMs')
+        # looks to see if padded rasters have already been downloaded
+        self.downloaded_rasters = glob('../data/arcticDEM/padded*.tiff')
+        
+        self.get_missing_dems()
+        
+        if self.missing_dems is False:
+            print('already downloaded and padded all the DEMs')
         else:
+            print(f'need download {len(self.missing_dems)} DEMs')
             self.get_dems()
-            self.export_dems()
-    
+            # self.export_dems()
+
+        print('all done')
+        
     def get_catalog(self):
         '''
         opens arctic DEM catalog,
@@ -121,12 +129,34 @@ class Elevation():
         catalog = catalog.to_crs(4326)
         self.catalog = catalog.loc[catalog.intersects(self.geo)]
         print(f'filtered catalog has {len(self.catalog)} dems')
+
+
+    def get_missing_dems(self):
+        '''
+        checks directory for downloaded (& padded DEMs)
+        compares that list with those in the catalog
+        and identifies those that still need to be downloaded
+        TODO add some logic/option here to allow for cases where
+        you don't want to download the missing ones
+        '''
+        def id_from_path(path):
+            _fname = os.path.basename(path)
+            return _fname.split('padded_')[-1].split('.tiff')[0]
+        
+        _dem_ids = [id_from_path(p) for p in self.downloaded_rasters]
+        _downloaded = [dem in self.catalog.dem_id.tolist() for dem in _dem_ids]
+        if all(_downloaded):
+            self.missing_dems = False
+        else:
+            _missing = [dem for dem, dld in zip(_dem_ids, _downloaded) if not dld]
+            self.missing_dems = self.catalog.loc[self.catalog.dem_id.isin(_missing)]
+
     
     @dask.delayed
     def get_dem(self, row):
         '''
         lazy function
-        where row is a single row from `self.catalog`
+        where row is a single row from `self.catalog` (or `self.missing_dems`)
         lazily open DEM COG and bitmask COG
         apply bitmask and pad to self.geo bounds
         return dask delayed object for writing to .tiff
@@ -173,7 +203,8 @@ class Elevation():
         get lazy delayed objects for each row in self.catalog
         '''
         self.rasters = []
-        for row in tqdm(self.catalog.itertuples()):
+        # for row in tqdm(self.catalog.itertuples()):
+        for row in tqdm(self.missing_dems.itertuples()):
             self.rasters.append(self.get_dem(row))
     
 
@@ -184,6 +215,31 @@ class Elevation():
         dask.compute(*self.rasters)
         
     ### coregistration routines ###
+    
+    @dask.delayed
+    def get_lazy_count(filepath):
+        with rio.open_rasterio(filepath, chunks='auto') as dem:
+            _total = (~dem.isnull()).sum().compute()
+            return _total.data.item()
+    
+    def delayed_counts(self):
+        counts = []
+        for f in self.downloaded_rasters:
+            count = Elevation.get_lazy_count(f)
+            counts.append(count)
+        return counts
+    
+    def get_counts_and_reference(self):
+        _lazy_counts = self.delayed_counts()
+        _result = dask.compute(*_lazy_counts)
+        self.count_result = dict(zip(self.downloaded_rasters, _result))
+        
+        _max = max(_result)
+        for k, v in self.count_result.items():
+            if v == _max:
+                self.ref_f = k
+
+    
     def get_date(self, filename):
         '''
         matching `padded_*.tiff` file with row in `self.catalog`
