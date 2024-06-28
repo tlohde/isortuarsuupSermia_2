@@ -183,7 +183,7 @@ class Elevation():
                 _masked = (xr.where(
                     (dem_clip == _fill_value)
                     | (bm_clip[:, :, :] > 0),
-                    np.nan,
+                    _fill_value,
                     dem_clip)
                             .rename('z')
                             .squeeze()
@@ -191,8 +191,8 @@ class Elevation():
                             )
                 
                 _padded = _masked.rio.pad_box(*self.geo_projected.bounds,
-                                              constant_values=np.nan)
-                
+                                              constant_values=_fill_value)
+                _padded.rio.write_nodata(_fill_value, inplace=True)
                 # _padded = _padded.expand_dims(
                 #     dim={'acqdate1': [row.acqdate1.to_numpy()]}
                 #     )
@@ -231,7 +231,9 @@ class Elevation():
         lazily count valid pixels in downloaded dem
         '''
         with rio.open_rasterio(filepath, chunks='auto') as dem:
-            _total = (~dem.isnull()).sum().compute()
+            _fill_value = dem.attrs['_FillValue']
+            _total = (dem != _fill_value).sum().compute()
+            # _total = (~dem.isnull()).sum().compute()
             return _total.data.item()
 
     def get_counts_and_reference(self):
@@ -306,7 +308,7 @@ class Elevation():
         
         with rio.open_rasterio(path, chunks='auto') as _ds:
             return xr.where(ndwi < 0, 1, 0).rio.reproject_match(_ds)
-    
+    # TODO return satellite image id of mask pairing to append to meta-data
 
     def get_masks(self):
         '''
@@ -324,6 +326,11 @@ class Elevation():
         
     @dask.delayed
     def lazy_register(pair_and_mask):
+        
+        def id_from_path(path):
+            _fname = os.path.basename(path)
+            return _fname.split('padded_')[-1].split('.tiff')[0]
+        
         _pair, _mask = pair_and_mask
         _ref_path, _to_reg_path = _pair
         _ref = xdem.DEM(_ref_path)
@@ -349,11 +356,11 @@ class Elevation():
 
         output = _regd.to_xarray()
         
-        output.attrs['to_register'] = _to_reg_path
+        output.attrs['to_register'] = id_from_path(_to_reg_path)
         # output.attrs['to_register_date'] = get_date(dem_to_reg).strftime('%Y-%m-%d')
         # output.attrs['to_reg_mask'] = to_reg_mask['id'].values.item()
         
-        output.attrs['reference'] = _ref_path
+        output.attrs['reference'] = id_from_path(_ref_path)
         # output.attrs['reference_date'] = get_date(reference).strftime('%Y-%m-%d')
         # output.attrs['ref_mask'] = ref_mask['id'].values.item()
         
@@ -370,8 +377,6 @@ class Elevation():
             _registered = Elevation.lazy_register(p_and_m)
             self.registered_dems.append(_registered)
             
-
-        
         
 class Velocity():
     '''
