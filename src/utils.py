@@ -83,12 +83,14 @@ class Elevation():
         
         if self.missing_dems is False:
             print('already downloaded and padded all the DEMs')
-        else:
-            print(f'need download {len(self.missing_dems)} DEMs')
+        elif len(self.downloaded_rasters) == 0:
+            self.missing_dems = self.catalog
             self.get_dems()
             self.export_dems()
-
-        print('all done')
+        else:
+            print(f'need to download {len(self.missing_dems)} DEMs')
+            self.get_dems()
+            self.export_dems()
         
     def get_catalog(self):
         '''
