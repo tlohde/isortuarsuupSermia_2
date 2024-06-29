@@ -91,6 +91,10 @@ class Elevation():
             print(f'need to download {len(self.missing_dems)} DEMs')
             self.get_dems()
             self.export_dems()
+
+        e.get_counts_and_reference()
+        e.get_masks()
+        e.register()
         
     def get_catalog(self):
         '''
@@ -268,7 +272,7 @@ class Elevation():
         _id = _fname.split('padded_')[-1].split('.tiff')[0]
         return self.catalog.loc[self.catalog.dem_id == _id, 'acqdate1'].item()
     
-    @dask.delayed
+    @dask.delayed(nout=2)
     def make_mask(self, path):
         '''
         make stable terrain mask for given saved/padded dem
@@ -335,7 +339,20 @@ class Elevation():
                                        _img_ids))
         
     @dask.delayed
-    def lazy_register(pair_and_mask):
+    def lazy_register(self, pair_and_mask):
+        '''
+        coregister dems
+        convert to xarray
+        calculate statistics
+        add metadata
+        export
+        pair_and_mask = 
+        (  
+            (ref_path, _to_reg_path),
+            stable_terrain_mask,
+            (_ref_img_id, _to_reg_img_id)
+        )
+        '''
         
         def id_from_path(path):
             _fname = os.path.basename(path)
@@ -368,11 +385,15 @@ class Elevation():
         output = _regd.to_xarray()
         
         output.attrs['to_register'] = id_from_path(_to_reg_path)
-        output.attrs['to_register_date'] = Elevation.date_from_path(_to_reg_path).strftime('%Y-%m-%d')
+        output.attrs['to_register_date'] = (
+            self.date_from_path(_to_reg_path).strftime('%Y-%m-%d')
+        )
         output.attrs['to_reg_mask'] = _to_reg_img_id
         
         output.attrs['reference'] = id_from_path(_ref_path)
-        output.attrs['reference_date'] = Elevation.date_from_path(_ref_path).strftime('%Y-%m-%d')
+        output.attrs['reference_date'] = (
+            self.date_from_path(_ref_path).strftime('%Y-%m-%d')
+        )
         output.attrs['ref_mask'] = _ref_img_id
         
         output.attrs['before_nmad'] = before_nmad
@@ -383,10 +404,37 @@ class Elevation():
         return output
         
     def register(self):
+        '''
+        apply coregistration and export
+        '''
+        
+        if os.path.exists('../data/arcticDEM/coregd'):
+            pass
+        else:
+            os.mkdir('../data/arcticDEM/coregd')
+
         self.registered_dems = []
+        # lazily coregister and export
         for p_and_m in self.pairs_and_mask_id[0:2]:
-            _registered = Elevation.lazy_register(p_and_m)
-            self.registered_dems.append(_registered)
+            _registered = self.lazy_register(p_and_m)
+            # self.registered_dems.append(_registered)
+
+            _fname = os.path.basename(p_and_m[0][1])
+            _fname = _fname.replace('padded', 'coregd')
+
+            if os.path.exists(f'../data/arcticDEM/coregd/{_fname}'):
+                continue
+            else:
+                _delayed_write = _registered.rio.to_raster(
+                    f'../data/arcticDEM/coregd/{_fname}',
+                    compute=False,
+                    lock=Lock()
+                    )
+                self.registered_dems.append(_delayed_write)
+        
+        # export and compute
+        print('collected all dems, ready for export...')
+        dask.compute(*self.registered_dems)
 
 
 class Velocity():
