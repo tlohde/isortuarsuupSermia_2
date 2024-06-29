@@ -290,7 +290,7 @@ class Elevation():
         assert len(_items) > 0, 'did not find any images'
         
         least_cloudy_item = min(_items, key=lambda item: eo.ext(item).cloud_cover)
-
+        
         _asset_dict = {'l':['green','nir08'],
                        'S':['B03', 'B08']}
 
@@ -309,8 +309,8 @@ class Elevation():
         
         
         with rio.open_rasterio(path, chunks='auto') as _ds:
-            return xr.where(ndwi < 0, 1, 0).rio.reproject_match(_ds)
-    # TODO return satellite image id of mask pairing to append to meta-data
+            return (least_cloudy_item.id, xr.where(ndwi < 0, 1, 0).rio.reproject_match(_ds))
+
 
     def get_masks(self):
         '''
@@ -318,13 +318,21 @@ class Elevation():
         and & it with stable terrain for every other dem
         to make list combined masks.
         '''
-        self.ref_mask = self.make_mask(self.ref)
+        self.ref_img_id, self.ref_mask = self.make_mask(self.ref)
         self.combined_to_reg_masks = []
+        self.combined_to_reg_img_ids = []
         for f in self.to_reg:
-            _mask = self.make_mask(f)
+            _id, _mask = self.make_mask(f)
             _combined_mask = ((self.ref_mask & _mask) == 1).data
             self.combined_to_reg_masks.append(_combined_mask)
-        self.pairs_and_mask = list(zip(self.pairs, self.combined_to_reg_masks))
+            self.combined_to_reg_img_ids.append(_id)
+            
+        _img_ids = list(product([self.ref_img_id],
+                                self.combined_to_reg_img_ids))
+
+        self.pairs_and_mask_id = list(zip(self.pairs,
+                                       self.combined_to_reg_masks,
+                                       _img_ids))
         
     @dask.delayed
     def lazy_register(pair_and_mask):
@@ -333,8 +341,9 @@ class Elevation():
             _fname = os.path.basename(path)
             return _fname.split('padded_')[-1].split('.tiff')[0]
         
-        _pair, _mask = pair_and_mask
+        _pair, _mask, _id = pair_and_mask
         _ref_path, _to_reg_path = _pair
+        _ref_img_id, _to_reg_img_id = _id
         _ref = xdem.DEM(_ref_path)
         _to_reg = xdem.DEM(_to_reg_path)
         
@@ -359,12 +368,12 @@ class Elevation():
         output = _regd.to_xarray()
         
         output.attrs['to_register'] = id_from_path(_to_reg_path)
-        # output.attrs['to_register_date'] = get_date(dem_to_reg).strftime('%Y-%m-%d')
-        # output.attrs['to_reg_mask'] = to_reg_mask['id'].values.item()
+        output.attrs['to_register_date'] = Elevation.date_from_path(_to_reg_path).strftime('%Y-%m-%d')
+        output.attrs['to_reg_mask'] = _to_reg_img_id
         
         output.attrs['reference'] = id_from_path(_ref_path)
-        # output.attrs['reference_date'] = get_date(reference).strftime('%Y-%m-%d')
-        # output.attrs['ref_mask'] = ref_mask['id'].values.item()
+        output.attrs['reference_date'] = Elevation.date_from_path(_ref_path).strftime('%Y-%m-%d')
+        output.attrs['ref_mask'] = _ref_img_id
         
         output.attrs['before_nmad'] = before_nmad
         output.attrs['after_nmad'] = after_nmad
@@ -375,11 +384,11 @@ class Elevation():
         
     def register(self):
         self.registered_dems = []
-        for p_and_m in self.pairs_and_mask[0:2]:
+        for p_and_m in self.pairs_and_mask_id[0:2]:
             _registered = Elevation.lazy_register(p_and_m)
             self.registered_dems.append(_registered)
-            
-        
+
+
 class Velocity():
     '''
     class for handling itslive velocity cubes
