@@ -38,9 +38,13 @@ if elevation:
     # set dask cluster running
     if __name__ == '__main__':
         print('name is main, apparently')
-        with LocalCluster() as cluster, Client(cluster) as client:
-            print(client.dashboard_link)
-            e = utils.Elevation(aoi)
+        cluster = LocalCluster()
+        client = cluster.get_client()
+
+        e = utils.Elevation(aoi)
+
+        client.shutdown()
+        client.close()
         
 ### the velocity chunk of code below has been run. and it works fine
 ### leave it alone ###

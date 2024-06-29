@@ -92,9 +92,9 @@ class Elevation():
             self.get_dems()
             self.export_dems()
 
-        e.get_counts_and_reference()
-        e.get_masks()
-        e.register()
+        self.get_counts_and_reference()
+        self.get_masks()
+        # self.register()
         
     def get_catalog(self):
         '''
@@ -315,7 +315,6 @@ class Elevation():
         with rio.open_rasterio(path, chunks='auto') as _ds:
             return (least_cloudy_item.id, xr.where(ndwi < 0, 1, 0).rio.reproject_match(_ds))
 
-
     def get_masks(self):
         '''
         make stable terrain mask from reference dem
@@ -338,7 +337,7 @@ class Elevation():
                                        self.combined_to_reg_masks,
                                        _img_ids))
         
-    @dask.delayed
+    # @dask.delayed
     def lazy_register(self, pair_and_mask):
         '''
         coregister dems
@@ -361,6 +360,19 @@ class Elevation():
         _pair, _mask, _id = pair_and_mask
         _ref_path, _to_reg_path = _pair
         _ref_img_id, _to_reg_img_id = _id
+
+        _mask = _mask.compute()
+        _ref_img_id = _ref_img_id.compute()
+        _to_reg_img_id = _to_reg_img_id.compute()
+        
+        print(
+            f'_ref_path: {_ref_path}\n',
+            f'_to_reg_path: {_to_reg_path}\n',
+            f'_ref_img_id: {_ref_img_id}\n',
+            f'_to_reg_img_id: {_to_reg_img_id}\n',
+            f'_mask: {_mask}'
+            )
+        
         _ref = xdem.DEM(_ref_path)
         _to_reg = xdem.DEM(_to_reg_path)
         
@@ -407,35 +419,39 @@ class Elevation():
         '''
         apply coregistration and export
         '''
-        
-        if os.path.exists('../data/arcticDEM/coregd'):
-            pass
-        else:
-            os.mkdir('../data/arcticDEM/coregd')
-
         self.registered_dems = []
         # lazily coregister and export
-        for p_and_m in self.pairs_and_mask_id[0:2]:
-            _registered = self.lazy_register(p_and_m)
-            # self.registered_dems.append(_registered)
+        for i, p_and_m in enumerate(self.pairs_and_mask_id):
+            print(f'working on {i}/{len(self.pairs_and_mask_id)}')
+            try:
+                _registered = self.lazy_register(p_and_m)
+                
+                # self.registered_dems.append(_registered)
+                _fname = os.path.basename(p_and_m[0][1])
+                _fname = _fname.replace('padded', 'coregd')
+    
+                # check if it has already been computed & exported
+                if os.path.exists(f'../data/arcticDEM/coregd/{_fname}'):
+                    continue
+                else:
+                    _delayed_write = _registered.rio.to_raster(
+                        f'../data/arcticDEM/coregd/{_fname}',
+                        compute=True,
+                        lock=Lock()
+                        )
+                    self.registered_dems.append(_delayed_write)
 
-            _fname = os.path.basename(p_and_m[0][1])
-            _fname = _fname.replace('padded', 'coregd')
-
-            if os.path.exists(f'../data/arcticDEM/coregd/{_fname}'):
-                continue
-            else:
-                _delayed_write = _registered.rio.to_raster(
-                    f'../data/arcticDEM/coregd/{_fname}',
-                    compute=False,
-                    lock=Lock()
-                    )
-                self.registered_dems.append(_delayed_write)
-        
-        # export and compute
-        print('collected all dems, ready for export...')
+            except Exception as e:
+                print(e)
+                print(f'skipping: {p_and_m[0][1]}')
+            
+    
+    def expot_registered_dems(self):
+        '''
+        compute / export all the dems
+        '''
         dask.compute(*self.registered_dems)
-
+        
 
 class Velocity():
     '''
