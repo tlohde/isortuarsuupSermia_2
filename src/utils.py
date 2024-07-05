@@ -22,6 +22,7 @@ import pystac_client
 from pystac.extensions.eo import EOExtension as eo
 import shapely
 from shapely import wkt
+from rasterio.enums import Resampling
 import rioxarray as rio
 from scipy.stats import median_abs_deviation
 import stackstac
@@ -93,9 +94,14 @@ class Elevation():
             self.export_dems()
 
         self.get_counts_and_reference()
+        self.dem_mask_dict = {}
         self.get_masks()
-        # self.register()
-        
+        self.export_masks()
+        self.prepare_coregistration()
+        # self.do_coregistration()
+        # self.stack()
+
+
     def get_catalog(self):
         '''
         opens arctic DEM catalog,
@@ -272,185 +278,408 @@ class Elevation():
         _id = _fname.split('padded_')[-1].split('.tiff')[0]
         return self.catalog.loc[self.catalog.dem_id == _id, 'acqdate1'].item()
     
-    @dask.delayed(nout=2)
+    @dask.delayed
     def make_mask(self, path):
         '''
         make stable terrain mask for given saved/padded dem
         '''
-        _catalog = pystac_client.Client.open(
-            "https://planetarycomputer.microsoft.com/api/stac/v1",
-            modifier=pc.sign_inplace
-            )
         
-        _date = self.date_from_path(path)
-        d1 = (_date - pd.Timedelta('14d')).strftime('%Y-%m-%d')
-        d2 = (_date + pd.Timedelta('14d')).strftime('%Y-%m-%d')
-        _search_period = f'{d1}/{d2}'
-        _search = _catalog.search(collections=['sentinel-2-l2a',
-                                               'landsat-c2-l2'],
-                                  intersects=self.geo,
-                                  datetime=_search_period)
-        _items = _search.item_collection()
-        assert len(_items) > 0, 'did not find any images'
+        _dem_id = os.path.basename(path).split('.tiff')[0]
         
-        least_cloudy_item = min(_items, key=lambda item: eo.ext(item).cloud_cover)
-        
-        _asset_dict = {'l':['green','nir08'],
-                       'S':['B03', 'B08']}
+        _fname = f'../data/arcticDEM/masks/mask_{_dem_id}.tiff'
+        if os.path.exists(_fname):
+            pass
+        else:
+            _catalog = pystac_client.Client.open(
+                "https://planetarycomputer.microsoft.com/api/stac/v1",
+                modifier=pc.sign_inplace
+                )
+            
+            _date = self.date_from_path(path)
+            d1 = (_date - pd.Timedelta('14d')).strftime('%Y-%m-%d')
+            d2 = (_date + pd.Timedelta('14d')).strftime('%Y-%m-%d')
+            _search_period = f'{d1}/{d2}'
+            _search = _catalog.search(collections=['sentinel-2-l2a',
+                                                'landsat-c2-l2'],
+                                    intersects=self.geo,
+                                    datetime=_search_period)
+            _items = _search.item_collection()
+            assert len(_items) > 0, 'did not find any images'
+            
+            least_cloudy_item = min(_items, key=lambda item: eo.ext(item).cloud_cover)
+            
+            self.dem_mask_dict[_dem_id] = least_cloudy_item.id
+            
+            _asset_dict = {'l':['green','nir08'],
+                        'S':['B03', 'B08']}
 
-        _assets = _asset_dict[least_cloudy_item.properties['platform'][0]]
+            _assets = _asset_dict[least_cloudy_item.properties['platform'][0]]
+            
+            img = (stackstac.stack(
+                least_cloudy_item, epsg=3413,assets=_assets
+                ).squeeze()
+                .rio.clip_box(*self.geo.bounds, crs=4326)
+                )
+            
+            # can use [] indexing here because the order
+            # of assets in _asset dict is consistent 
+            ndwi = ((img[0,:,:] - img[1,:,:]) /
+                    (img[0,:,:] + img[1,:,:]))
+            
+            
+            with rio.open_rasterio(path, chunks='auto') as _ds:
+                _mask = xr.where(ndwi < 0, 1, 0).rio.reproject_match(_ds)
+            
+            _mask.attrs['id'] = least_cloudy_item.id
+            _mask.attrs['dem_id'] = _dem_id
         
-        img = (stackstac.stack(
-            least_cloudy_item, epsg=3413,assets=_assets
-            ).squeeze()
-            .rio.clip_box(*self.geo.bounds, crs=4326)
-            )
-        
-        # can use [] indexing here because the order
-        # of assets in _asset dict is consistent 
-        ndwi = ((img[0,:,:] - img[1,:,:]) /
-                (img[0,:,:] + img[1,:,:]))
-        
-        
-        with rio.open_rasterio(path, chunks='auto') as _ds:
-            return (least_cloudy_item.id, xr.where(ndwi < 0, 1, 0).rio.reproject_match(_ds))
+
+            _delayed_write = _mask.rio.to_raster(_fname,
+                                                 compute=True,
+                                                 lock=Lock()
+                                                 )
+            return _delayed_write
+
 
     def get_masks(self):
         '''
-        make stable terrain mask from reference dem
-        and & it with stable terrain for every other dem
-        to make list combined masks.
+        get lazy delayed mask for each downloaded dem
         '''
-        self.ref_img_id, self.ref_mask = self.make_mask(self.ref)
-        self.combined_to_reg_masks = []
-        self.combined_to_reg_img_ids = []
-        for f in self.to_reg:
-            _id, _mask = self.make_mask(f)
-            _combined_mask = ((self.ref_mask & _mask) == 1).data
-            self.combined_to_reg_masks.append(_combined_mask)
-            self.combined_to_reg_img_ids.append(_id)
-            
-        _img_ids = list(product([self.ref_img_id],
-                                self.combined_to_reg_img_ids))
-
-        self.pairs_and_mask_id = list(zip(self.pairs,
-                                       self.combined_to_reg_masks,
-                                       _img_ids))
-        
-    # @dask.delayed
-    def lazy_register(self, pair_and_mask):
-        '''
-        coregister dems
-        convert to xarray
-        calculate statistics
-        add metadata
-        export
-        pair_and_mask = 
-        (  
-            (ref_path, _to_reg_path),
-            stable_terrain_mask,
-            (_ref_img_id, _to_reg_img_id)
-        )
-        '''
-        
-        def id_from_path(path):
-            _fname = os.path.basename(path)
-            return _fname.split('padded_')[-1].split('.tiff')[0]
-        
-        _pair, _mask, _id = pair_and_mask
-        _ref_path, _to_reg_path = _pair
-        _ref_img_id, _to_reg_img_id = _id
-
-        _mask = _mask.compute()
-        _ref_img_id = _ref_img_id.compute()
-        _to_reg_img_id = _to_reg_img_id.compute()
-        
-        print(
-            f'_ref_path: {_ref_path}\n',
-            f'_to_reg_path: {_to_reg_path}\n',
-            f'_ref_img_id: {_ref_img_id}\n',
-            f'_to_reg_img_id: {_to_reg_img_id}\n',
-            f'_mask: {_mask}'
-            )
-        
-        _ref = xdem.DEM(_ref_path)
-        _to_reg = xdem.DEM(_to_reg_path)
-        
-        _pipeline = xdem.coreg.NuthKaab() + xdem.coreg.Tilt()
-        _pipeline.fit(
-            reference_dem=_ref,
-            dem_to_be_aligned=_to_reg,
-            inlier_mask=_mask
-        )
-        
-        _regd = _pipeline.apply(_to_reg)
-        
-        stable_diff_before = (_ref - _to_reg)[_mask]
-        stable_diff_after = (_ref - _regd)[_mask]
-        
-        before_median = np.ma.median(stable_diff_before)
-        after_median = np.ma.median(stable_diff_after)
-        
-        before_nmad = xdem.spatialstats.nmad(stable_diff_before)
-        after_nmad = xdem.spatialstats.nmad(stable_diff_after)
-
-        output = _regd.to_xarray()
-        
-        output.attrs['to_register'] = id_from_path(_to_reg_path)
-        output.attrs['to_register_date'] = (
-            self.date_from_path(_to_reg_path).strftime('%Y-%m-%d')
-        )
-        output.attrs['to_reg_mask'] = _to_reg_img_id
-        
-        output.attrs['reference'] = id_from_path(_ref_path)
-        output.attrs['reference_date'] = (
-            self.date_from_path(_ref_path).strftime('%Y-%m-%d')
-        )
-        output.attrs['ref_mask'] = _ref_img_id
-        
-        output.attrs['before_nmad'] = before_nmad
-        output.attrs['after_nmad'] = after_nmad
-        output.attrs['before_median'] = before_median
-        output.attrs['after_median'] = after_median
-        
-        return output
-        
-    def register(self):
-        '''
-        apply coregistration and export
-        '''
-        self.registered_dems = []
-        # lazily coregister and export
-        for i, p_and_m in enumerate(self.pairs_and_mask_id):
-            print(f'working on {i}/{len(self.pairs_and_mask_id)}')
-            try:
-                _registered = self.lazy_register(p_and_m)
-                
-                # self.registered_dems.append(_registered)
-                _fname = os.path.basename(p_and_m[0][1])
-                _fname = _fname.replace('padded', 'coregd')
+        self.mask_rasters = []
+        for _dem_path in tqdm(self.downloaded_rasters):
+            self.mask_rasters.append(self.make_mask(_dem_path))
     
-                # check if it has already been computed & exported
-                if os.path.exists(f'../data/arcticDEM/coregd/{_fname}'):
-                    continue
-                else:
-                    _delayed_write = _registered.rio.to_raster(
-                        f'../data/arcticDEM/coregd/{_fname}',
-                        compute=True,
-                        lock=Lock()
-                        )
-                    self.registered_dems.append(_delayed_write)
 
-            except Exception as e:
-                print(e)
-                print(f'skipping: {p_and_m[0][1]}')
-            
-    
-    def expot_registered_dems(self):
+    def export_masks(self):
         '''
         compute / export all the dems
         '''
-        dask.compute(*self.registered_dems)
+        if os.path.exists('../data/arcticDEM/masks'):
+            pass
+        else:
+            os.mkdir('../data/arcticDEM/masks')
+        dask.compute(*self.mask_rasters)
+    
+    
+    def prepare_coregistration(self):
+        
+        def id_from_path(id):
+            return os.path.basename(id).split('padded_')[-1].split('.tiff')[0]
+        
+        self.downloaded_masks = glob('../data/arcticDEM/masks/*.tiff')
+        
+        # get dem/mask pairs
+        self.dem_mask_pairs = []
+        for x in self.downloaded_rasters:
+            for y in self.downloaded_masks:
+                if id_from_path(y) == id_from_path(x):
+                    self.dem_mask_pairs.append((x,y))
+                    
+        self.ref_dem_mask_pair = [
+            p for p in self.dem_mask_pairs if p[0] == self.ref
+            ]
+        
+        self.to_reg_dem_mask_pairs = [
+            p for p in self.dem_mask_pairs if p != self.ref_dem_mask_pair
+            ]
+        
+        self.coreg_pairs = list(
+            product(
+                self.ref_dem_mask_pair, self.to_reg_dem_mask_pairs
+                )
+            )
+        
+        
+    def coreg(self, pair):
+        
+        def id_from_path(id):
+            return os.path.basename(id).split('padded_')[-1].split('.tiff')[0]
+
+        reference, to_register = pair
+        ref_dem, ref_mask = reference
+        reg_dem, reg_mask = to_register
+            
+        fname = os.path.basename(reg_dem).replace('padded', 'coreg')
+        fpath = f'../data/arcticDEM/coregd/{fname}'
+        if os.path.exists(fpath):
+            # print(f'already done: {fpath}')
+            return None
+        else:
+            with rio.open_rasterio(reg_mask, chunks='auto') as _regmask_arr:
+                _reg_mask_id = _regmask_arr.attrs['id']
+                with rio.open_rasterio(ref_mask, chunks='auto') as _refmask_arr:
+                    _ref_mask_id = _refmask_arr.attrs['id']
+                    _mask = ((_refmask_arr & _regmask_arr) == 1).squeeze().compute().data
+
+            try:
+                _ref = xdem.DEM(ref_dem)
+                _to_reg = xdem.DEM(reg_dem)
+                
+                _pipeline = xdem.coreg.NuthKaab() + xdem.coreg.Tilt()
+                
+                _pipeline.fit(
+                    reference_dem=_ref,
+                    dem_to_be_aligned=_to_reg,
+                    inlier_mask=_mask
+                )
+                
+                coregistered = _pipeline.apply(_to_reg)
+                
+                stable_diff_before = (_ref - _to_reg)[_mask]
+                stable_diff_after = (_ref - coregistered)[_mask]
+                
+                median_before = np.ma.median(stable_diff_before)
+                median_after = np.ma.median(stable_diff_after)
+                
+                nmad_before = xdem.spatialstats.nmad(stable_diff_before)
+                nmad_after = xdem.spatialstats.nmad(stable_diff_after)
+                
+                output = coregistered.to_xarray()
+                    
+                output.attrs['to_register'] = id_from_path(reg_dem)
+                output.attrs['to_register_date'] = (
+                    self.date_from_path(reg_dem).strftime('%Y-%m-%d')
+                )
+                
+                output.attrs['to_reg_mask'] = _reg_mask_id
+                
+                output.attrs['reference'] = id_from_path(ref_dem)
+                output.attrs['reference_date'] = (
+                    self.date_from_path(ref_dem).strftime('%Y-%m-%d')
+                )
+                
+                output.attrs['ref_mask'] = _ref_mask_id
+                
+                output.attrs['nmad_before'] = nmad_before
+                output.attrs['nmad_after'] = nmad_after
+                output.attrs['median_before'] = median_before
+                output.attrs['median_after'] = median_after
+                
+                return output.rio.to_raster(fpath,
+                                            compute=True,
+                                            lock=Lock())
+            
+            except Exception as e:
+                print(e)
+                print(f'failed: {reg_dem}')
+                self.failed[reg_dem] = e
+    
+    def do_coregistration(self):
+        
+        def id_from_path(id):
+            return os.path.basename(id).split('padded_')[-1].split('.tiff')[0]
+        
+                # copy reference dem across
+        _ref_dem, _ref_mask = self.ref_dem_mask_pair[0]
+        
+        with rio.open_rasterio(_ref_dem,
+                               chunks='auto') as reference_dem:
+            with rio.open_rasterio(_ref_mask,
+                                   chunks='auto') as reference_mask:
+
+                fname = os.path.basename(self.ref).replace('padded', 'coreg')
+                fpath = f'../data/arcticDEM/coregd/{fname}'
+                
+                reference_dem.attrs['to_register'] = id_from_path(_ref_dem)
+                reference_dem.attrs['to_register_date'] = (
+                    self.date_from_path(_ref_dem).strftime('%Y-%m-%d')
+                )
+                
+                reference_dem.attrs['to_reg_mask'] = reference_mask.attrs['id']
+                
+                reference_dem.attrs['reference'] = id_from_path(_ref_dem)
+                reference_dem.attrs['reference_date'] = (
+                    self.date_from_path(_ref_dem).strftime('%Y-%m-%d')
+                )
+                
+                reference_dem.attrs['ref_mask'] = reference_mask.attrs['id']
+                
+                reference_dem.attrs['nmad_before'] = np.nan
+                reference_dem.attrs['nmad_after'] = np.nan
+                reference_dem.attrs['median_before'] = np.nan
+                reference_dem.attrs['median_after'] = np.nan
+                
+                reference_dem.rio.to_raster(fpath)
+        
+        # do coreg, keep track of those that fail
+        self.failed = {}
+        for pair in tqdm(self.coreg_pairs):
+            self.coreg(pair)
+
+    def stack(self):
+        _directory = '../data/arcticDEM/coregd/'
+        self.coregd_files = glob(f'{_directory}*.tiff')
+        print(f'there are {len(self.coregd_files)} coregistered files')
+        dems = []
+        attrs = []
+
+        for f in self.coregd_files:
+            with rio.open_rasterio(f, chunks='auto') as ds:
+                _acqdate1 = self.catalog.loc[
+                    self.catalog.dem_id == ds.attrs['to_register'],
+                    'acqdate1'
+                ]
+                assert len(_acqdate1) == 1, 'too many matches'
+                    
+                time_index = xr.DataArray(
+                    data=_acqdate1, # [pd.to_datetime(ds.attrs['to_register_date'], format="%Y-%m-%d")],
+                    dims=['band'],
+                    coords={'band':[1]})
+                ds['time'] = time_index
+                ds = (ds.swap_dims({'band': 'time'})
+                    .drop_vars('band')
+                    .rename('z')
+                    )
+                
+                if '_FillValue' in ds.attrs.keys():
+                    fill_value = ds.attrs['_FillValue']
+                    ds = xr.where(ds!=fill_value, ds, np.nan, keep_attrs=True)
+                    ds.attrs['_FillValue'] = np.nan
+                    dems.append(ds)
+                else:
+                    ds.attrs['_FillValue'] = np.nan
+                    dems.append(ds)
+
+                attrs.append(ds.attrs)
+
+        meta_df = pd.DataFrame(attrs)
+        meta_df.drop(columns=['AREA_OR_POINT', 'processed_by',
+                            'scale_factor', 'add_offset',
+                            '_FillValue', 'long_name'],
+                    errors='ignore',
+                    inplace=True)
+
+        meta_df['reference_date'] = pd.to_datetime(meta_df.reference_date, format="%Y-%m-%d")
+        meta_df['to_register_date'] = pd.to_datetime(meta_df.to_register_date, format="%Y-%m-%d")
+        meta_df.sort_values(by='to_register_date', inplace=True)
+        
+        self.metadata = meta_df[[
+            'to_register_date',
+            'nmad_before', 'nmad_after',
+            'median_before', 'median_after',
+            'to_register', 'to_reg_mask',
+            'reference_date', 'reference', 'ref_mask'
+        ]]
+        
+        self.metadata = self.metadata.merge(
+            self.catalog.set_index('dem_id')['acqdate1'],
+            left_on='to_register',
+            right_index=True
+            )
+        
+        # meta_df.to_csv(f'stacked_coregistered_{self.directory}_meta.csv')
+
+        demstack = (xr.concat(dems,
+                              dim='time',
+                              combine_attrs='drop')
+                    .sortby('time')).chunk('auto')
+        
+        
+        self.demstack = xr.merge([demstack,
+                                  (self.metadata.set_index('acqdate1')
+                                   .to_xarray().rename({'acqdate1':'time'})
+                                  )])
+        
+        ## add meta data
+        
+        self.demstack['z'].attrs = {
+            'description': 'time dependent coregistered elevations',
+            'units': 'metres'}
+
+        self.demstack['time'].attrs = {
+            'description': 'acqdate1 time from arcticDEM catalog'
+        }
+
+        self.demstack['to_register_date'].attrs = {
+            'description': 'date of DEM - same as `time`'
+        }
+
+        self.demstack['nmad_after'].attrs = {
+            'description': '''
+            normalized median absolute deviation of differences in elevation
+            over `stable terrain` between the reference dem and to_register_dem
+            _after_ the coregistration process. lower is better.
+            ''',
+            'units': 'metres'
+        }
+
+        self.demstack['nmad_before'].attrs = {
+            'description': '''
+            normalized median absolute deviation of differences in elevation over
+            `stable terrain` between the reference dem and to_register_dem _before_
+            the coregistration process. lower is better
+            ''',
+            'units': 'metres'
+        }
+
+        self.demstack['median_after'].attrs = {
+            'description': '''
+            median difference in elevations over stable terrain between reference
+            and to_register_dem _after_ coregistration. closer to zero is better.
+            ''',
+            'units': 'metres'
+        }
+
+        self.demstack['median_before'].attrs = {
+            'description': '''
+            median difference in elevations over stable terrain between reference
+            and to_register_dem _before_ coregistration. closer to zero is better.
+            ''',
+            'units': 'metres'
+        }
+
+        self.demstack['ref_mask'].attrs = {
+            'description': 'satellite image id used to make stable terrain mask for reference DEM'
+        }
+
+        self.demstack['to_reg_mask'].attrs = {
+            'description': 'satellite image id used to make stable terrain mask for to_register_dem'
+        }
+
+        self.demstack['to_register'].attrs = {
+            'description': 'id of arctic DEM used that has been coregistered'
+        }
+
+        self.demstack['reference'].attrs = {
+            'description': 'id of reference DEM used to coregister'
+        }
+
+        self.demstack['reference_date'].attrs = {
+            'description': 'date of reference dem used in coregistration process'
+        }        
+
+        self.demstack.attrs = {
+            'processed on': pd.Timestamp.now().strftime('%Y-%m-%d')
+            }
+
+        if os.path.exists('../data/arcticDEM/coregd/stacked.zarr'):
+            pass
+        else:
+            self.demstack.to_zarr('../data/arcticDEM/coregd/stacked.zarr')
+        
+    def downsample(self, factor=10):
+        
+        new_width = int(self.demstack['z'].rio.width / factor)
+        new_height = int(self.demstack['z'].rio.height / factor)
+
+        down_sampled = self.demstack['z'].rio.reproject(
+            self.demstack['z'].rio.crs,
+            shape=(new_height, new_width),
+            resampling=Resampling.bilinear
+        )
+        down_sampled = down_sampled.rio.write_nodata(np.nan)
+
+        downsampled = xr.merge([down_sampled,
+                                self.demstack.drop_vars(['z','x','y'])])
+
+        downsampled.attrs['description'] = '''
+        time dependent coregistered elvations. bilinearly downsampled to ~20x20 m
+        from native 2x2 m resolution of arctic DEM
+        '''
+
+        downsampled.to_netcdf('../data/arcticDEM/coregd/dem_stack.nc')
+    
+    
         
 
 class Velocity():
