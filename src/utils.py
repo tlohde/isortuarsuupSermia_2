@@ -24,7 +24,7 @@ import shapely
 from shapely import wkt
 from rasterio.enums import Resampling
 import rioxarray as rio
-from scipy.stats import median_abs_deviation
+from scipy.stats import median_abs_deviation, theilslopes
 import stackstac
 import subprocess
 from tqdm import tqdm
@@ -59,6 +59,69 @@ def geo_reproject(geo,
     elif isinstance(geo, shapely.geometry.linestring.LineString):
         _x, _y = geo.coords.xy
         return shapely.Linestring(zip(*transformer.transform(_x, _y)))
+
+def robust_slope(y, t):
+    '''
+    for robust trends using theilslopes
+    y - input array of variable of concern
+    t - array of corresponding timestamps
+        converts timestamps to years since first observation
+        identify nan values in `y`, return theilslopes for non-nan values
+    '''
+    x = (t-t.min()) / pd.Timedelta('365.25D')
+    idx = np.isnan(y)  # .compute()
+    # print(idx.shape)
+    if len(idx) == idx.sum():
+        return np.stack((np.nan, np.nan, np.nan, np.nan),
+                        axis=-1)
+    else:
+        slope, intercept, low, high = theilslopes(y[~idx], x[~idx])
+        return np.stack((slope, intercept, low, high),
+                        axis=-1)
+
+
+def make_robust_trend(ds, inp_core_dim='time'):
+    '''
+    robust_slope as ufunc to dask array, dss
+    this is a lazy operation
+    --> very helpful SO
+    https://stackoverflow.com/questions/58719696/
+    how-to-apply-a-xarray-u-function-over-netcdf-and-return-a-2d-array-multiple-new
+    /62012973#62012973
+    --> also helpful:https://stackoverflow.com/questions/71413808/
+    understanding-xarray-apply-ufunc
+    --> and this:
+    https://docs.xarray.dev/en/stable/examples/
+    apply_ufunc_vectorize_1d.html#apply_ufunc
+    '''
+    output = xr.apply_ufunc(robust_slope,
+                            ds,
+                            ds[inp_core_dim],
+                            input_core_dims=[[inp_core_dim],
+                                             [inp_core_dim]],
+                            output_core_dims=[['result']],
+                            exclude_dims=set([inp_core_dim]),
+                            vectorize=True,
+                            dask='parallelized',
+                            output_dtypes=[float],
+                            dask_gufunc_kwargs={
+                                'allow_rechunk': True,
+                                'output_sizes': {'result': 4}
+                                }
+                            )
+    
+    output['result'] = xr.DataArray(['slope',
+                                     'intercept',
+                                     'low_slope',
+                                     'high_slope'],
+                                    dims=['result'])
+    
+    arrs = []
+    for i in range(output.shape[-1]):
+        var = output[:,:,i].result.item()
+        arrs.append(output[:,:,i].rename(var).drop_vars('result'))
+        
+    return xr.merge(arrs)
 
 
 class Elevation():
@@ -676,11 +739,30 @@ class Elevation():
         time dependent coregistered elvations. bilinearly downsampled to ~20x20 m
         from native 2x2 m resolution of arctic DEM
         '''
-
-        downsampled.to_netcdf('../data/arcticDEM/coregd/dem_stack.nc')
+        self.downsampled = downsampled.rio.write_crs('epsg:3413')
+        self.downsampled.to_netcdf('../data/arcticDEM/coregd/dem_stack.nc')
     
-    
+    def get_sec(self):
+        self.sec = make_robust_trend(
+            self.downsampled['z'].chunk({'time': -1,
+                                         'x': 500,
+                                         'y': 500})
+            )
         
+        self.sec.attrs = {'description': '''
+                theilslope estimates of surface elevation change
+                high_slope and low_slope are 0.95 confidence interval
+                ''',
+                }
+        
+        self.sec = self.sec.rio.write_crs(
+            self.downsampled.rio.crs,
+            'spatial_ref'
+            )
+        
+        self.sec.to_netcdf('../data/arcticDEM/coregd/sec_trend.nc')
+
+
 
 class Velocity():
     '''
